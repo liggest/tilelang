@@ -96,7 +96,8 @@ Stmt LowerFinalizeReducer(const FinalizeReducerOpNode &op,
 
     std::stringstream ss;
     ss << "tl::AscendAllReduce<" << op_str << ", " << reducing_threads << ", "
-       << scale << ", " << thread_offset << ">::run";
+       << scale << ", " << thread_offset << ", "
+       << lower_args.thread_bounds->extent << ">::run";
 
     Array<PrimExpr> thread_reduce_args = {StringImm(ss.str()),
                                           BufferLoad(buffer, indices_0)};

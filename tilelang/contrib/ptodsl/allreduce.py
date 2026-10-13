@@ -254,13 +254,19 @@ def _write_warp_partials(warp_val, scratch, *, wid, lid, scale: int) -> None:
 def _combine_warp_partials(lid, scratch, *, partial_base, num_warps: int, scale: int, reducer: str, identity):
     """Combine a group's warp partials on its leader warp (leader lanes only).
 
-    The caller wraps the emitted ops in the runtime leader-warp region; the
-    ``num_warps``/``scale``/``reducer`` dispatch is resolved at trace time.
+    ``partial_base`` is None for the single-group specialization, which
+    keeps the original slot indexing. The caller wraps the emitted ops in
+    the runtime leader-warp region; the ``num_warps``/``scale``/``reducer``
+    dispatch is resolved at trace time.
     """
+
+    def slot(index):
+        return index if partial_base is None else partial_base + index
+
     if scale == 1:
         loaded = scalar.select(
             lid < num_warps,
-            scalar.load(scratch, partial_base + lid),
+            scalar.load(scratch, slot(lid)),
             identity,
         )
         return _REDUCER_REDUX[reducer](loaded)
@@ -269,7 +275,7 @@ def _combine_warp_partials(lid, scratch, *, partial_base, num_warps: int, scale:
     if total <= 32:
         loaded = scalar.select(
             lid < total,
-            scalar.load(scratch, partial_base + lid),
+            scalar.load(scratch, slot(lid)),
             identity,
         )
         return _emit_butterfly(
@@ -284,23 +290,26 @@ def _combine_warp_partials(lid, scratch, *, partial_base, num_warps: int, scale:
     reduced = identity
     my_slot = lid % scale
     for w in range(num_warps):
-        idx_val = partial_base + w * scale + my_slot
-        loaded_v = scalar.load(scratch, idx_val)
+        loaded_v = scalar.load(scratch, slot(w * scale + my_slot))
         reduced = combine(reduced, loaded_v)
     return scalar.select(is_reducer, reduced, identity)
 
 
-def _leader_warp_reduce(tx, lid, scratch, *, threads, num_warps: int, scale: int, reducer: str, identity):
+def _leader_warp_reduce(tx, lid, scratch, *, threads, num_warps: int, scale: int, reducer: str, identity, single_group):
     """Let each group's leader warp combine its own warps' partials."""
-    group = tx // threads
-    is_leader_warp = (tx % threads) < 32
+    if single_group:
+        is_leader_warp = tx < 32
+        partial_base = None
+    else:
+        is_leader_warp = (tx % threads) < 32
+        partial_base = (tx // threads) * num_warps * scale
     with if_(is_leader_warp) as br:
         with br.then_:
             br.assign(
                 stage4_result=_combine_warp_partials(
                     lid,
                     scratch,
-                    partial_base=group * num_warps * scale,
+                    partial_base=partial_base,
                     num_warps=num_warps,
                     scale=scale,
                     reducer=reducer,
@@ -313,32 +322,41 @@ def _leader_warp_reduce(tx, lid, scratch, *, threads, num_warps: int, scale: int
     return br.stage4_result
 
 
-def _broadcast_warp_result(partial_reduced, scratch, *, tx, threads, scale: int):
+def _broadcast_warp_result(partial_reduced, scratch, *, tx, threads, scale: int, single_group):
     """Store the final partial and load the value broadcast within the group."""
-    group = tx // threads
-    local = tx % threads
-    # Broadcast only overwrites this group's partial region.
-    bcast_base = group * (threads // 32) * scale
-    is_group_leader = local < scale
+    if single_group:
+        is_group_leader = tx < scale
+        store_slot = tx
+        read_slot = tx % scale
+    else:
+        group = tx // threads
+        local = tx % threads
+        # Broadcast only overwrites this group's partial region.
+        bcast_base = group * (threads // 32) * scale
+        is_group_leader = local < scale
+        store_slot = bcast_base + local
+        read_slot = bcast_base + (local % scale)
     with if_(is_group_leader) as br5, br5.then_:
-        scalar.store(partial_reduced, scratch, bcast_base + local)
+        scalar.store(partial_reduced, scratch, store_slot)
 
     syncthreads()
-    result = scalar.load(scratch, bcast_base + (local % scale))
+    result = scalar.load(scratch, read_slot)
     syncthreads()
     return result
 
 
-def _emit_cross_warp_reduce(x, scratch, *, dtype, threads, scale, thread_offset, reducer):
+def _emit_cross_warp_reduce(x, scratch, *, dtype, threads, scale, thread_offset, reducer, all_threads=None):
     """Cross-warp all-reduce (threads > 32).
 
-    One call can cover several consecutive groups of ``threads`` threads.
+    One call can cover several consecutive groups of ``threads`` threads;
+    ``all_threads == threads`` emits the original single-group indexing.
     """
     num_warps = threads // 32
     c_identity = _const(
         _REDUCER_IDENTITY[reducer][dtype],
         dtype=_resolve(_REDUCER_IDENTITY_DTYPE[dtype]),
     )
+    single_group = all_threads == threads
     tx, wid, lid = _simt_warp_indexing(thread_offset=thread_offset)
     warp_val = _warp_partial_reduce(x, scale=scale, reducer=reducer)
     _write_warp_partials(warp_val, scratch, wid=wid, lid=lid, scale=scale)
@@ -354,6 +372,7 @@ def _emit_cross_warp_reduce(x, scratch, *, dtype, threads, scale, thread_offset,
         scale=scale,
         reducer=reducer,
         identity=c_identity,
+        single_group=single_group,
     )
 
     return _broadcast_warp_result(
@@ -362,6 +381,7 @@ def _emit_cross_warp_reduce(x, scratch, *, dtype, threads, scale, thread_offset,
         tx=tx,
         threads=threads,
         scale=scale,
+        single_group=single_group,
     )
 
 
@@ -436,7 +456,7 @@ def _check_params(*, threads, scale, thread_offset):
         raise ValueError(f"all_reduce requires threads % scale == 0; got threads={threads}, scale={scale}")
 
 
-def _simt_allreduce(value, *, threads, scale, thread_offset, scratch, reducer):
+def _simt_allreduce(value, *, threads, scale, thread_offset, scratch, reducer, all_threads=None):
     """Unified allreduce dispatch tree."""
     _check_params(threads=threads, scale=scale, thread_offset=thread_offset)
 
@@ -476,24 +496,30 @@ def _simt_allreduce(value, *, threads, scale, thread_offset, scratch, reducer):
         return _emit_ub_reduce(value, scratch, **args)
 
     if scale <= 32 and _is_pow2(threads) and _is_pow2(scale):
-        return _emit_cross_warp_reduce(value, scratch, **args)
+        return _emit_cross_warp_reduce(value, scratch, all_threads=all_threads, **args)
 
     return _emit_ub_reduce(value, scratch, **args)
 
 
-def simt_allreduce_sum(value, *, threads, scale=1, thread_offset=0, scratch=None):
+def simt_allreduce_sum(value, *, threads, scale=1, thread_offset=0, scratch=None, all_threads=None):
     """Sum reduce across SIMT work-items."""
-    return _simt_allreduce(value, threads=threads, scale=scale, thread_offset=thread_offset, scratch=scratch, reducer="sum")
+    return _simt_allreduce(
+        value, threads=threads, scale=scale, thread_offset=thread_offset, scratch=scratch, reducer="sum", all_threads=all_threads
+    )
 
 
-def simt_allreduce_max(value, *, threads, scale=1, thread_offset=0, scratch=None):
+def simt_allreduce_max(value, *, threads, scale=1, thread_offset=0, scratch=None, all_threads=None):
     """Max reduce across SIMT work-items."""
-    return _simt_allreduce(value, threads=threads, scale=scale, thread_offset=thread_offset, scratch=scratch, reducer="max")
+    return _simt_allreduce(
+        value, threads=threads, scale=scale, thread_offset=thread_offset, scratch=scratch, reducer="max", all_threads=all_threads
+    )
 
 
-def simt_allreduce_min(value, *, threads, scale=1, thread_offset=0, scratch=None):
+def simt_allreduce_min(value, *, threads, scale=1, thread_offset=0, scratch=None, all_threads=None):
     """Min reduce across SIMT work-items."""
-    return _simt_allreduce(value, threads=threads, scale=scale, thread_offset=thread_offset, scratch=scratch, reducer="min")
+    return _simt_allreduce(
+        value, threads=threads, scale=scale, thread_offset=thread_offset, scratch=scratch, reducer="min", all_threads=all_threads
+    )
 
 
 __all__ = [

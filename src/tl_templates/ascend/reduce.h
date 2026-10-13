@@ -132,9 +132,10 @@ template <> struct HwReduce<MinOp, uint32_t> {
  *   XOR offsets: 8, 4 → terminates at scale=4.
  *   This correctly reduces threads {0,4,8,12}, {1,5,9,13}, etc.
  */
-template <class Reducer, int threads, int scale = 1, int thread_offset = 0>
+template <class Reducer, int threads, int scale = 1, int thread_offset = 0,
+          int all_threads = threads>
 struct AscendAllReduce {
-  template <class, int, int, int> friend struct AscendAllReduce;
+  template <class, int, int, int, int> friend struct AscendAllReduce;
 
   static_assert(threads >= 1);
   static_assert(scale >= 1);
@@ -259,13 +260,18 @@ private:
     constexpr int num_warps = threads / 32;
     int tx = threadIdx.x - thread_offset;
     int wid = tx >> 5, lid = tx & 31;
-    // One call covers every consecutive group of `threads` threads; all
-    // slots below are derived from this thread's own group.
-    int group = tx / threads;
-    int local = tx % threads;
-    int partial_base = group * num_warps * scale;
-    // Broadcast only overwrites this group's partial region.
-    int bcast_base = group * num_warps * scale;
+    // Single-group calls keep the original indexing; otherwise one call
+    // covers every consecutive group of `threads` threads and all slots
+    // below are derived from this thread's own group.
+    int local = tx;
+    int partial_base = 0;
+    int bcast_base = 0;
+    if constexpr (all_threads != threads) {
+      local = tx % threads;
+      // Broadcast only overwrites this group's partial region.
+      partial_base = (tx / threads) * num_warps * scale;
+      bcast_base = partial_base;
+    }
 
     // Step 1: intra-warp reduce.
     U warp_val =

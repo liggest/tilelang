@@ -4382,11 +4382,12 @@ std::string CodeGenTileLangPTO::EmitAllReduceExpr_(const std::string &func_name,
   long long parsed_threads = 0;       // NOLINT(runtime/int)
   long long parsed_scale = 1;         // NOLINT(runtime/int)
   long long parsed_thread_offset = 0; // NOLINT(runtime/int)
+  long long parsed_all_threads = 0;   // NOLINT(runtime/int)
   const std::string pattern = std::string("tl::AscendAllReduce<") +
-                              reduction->tir_name + ", %lld, %lld, %lld";
+                              reduction->tir_name + ", %lld, %lld, %lld, %lld";
   const int parsed =
       std::sscanf(func_name.c_str() + begin, pattern.c_str(), &parsed_threads,
-                  &parsed_scale, &parsed_thread_offset);
+                  &parsed_scale, &parsed_thread_offset, &parsed_all_threads);
   ICHECK_GE(parsed, 1)
       << "AscendAllReduce expects at least a threads template parameter: "
       << func_name;
@@ -4409,8 +4410,11 @@ std::string CodeGenTileLangPTO::EmitAllReduceExpr_(const std::string &func_name,
 
   std::ostringstream os;
   os << reduction->pto_name << "(" << value << ", threads=" << threads
-     << ", scale=" << scale << ", thread_offset=" << thread_offset
-     << ", scratch=" << scratch << ")";
+     << ", scale=" << scale << ", thread_offset=" << thread_offset;
+  if (parsed >= 4) {
+    os << ", all_threads=" << parsed_all_threads;
+  }
+  os << ", scratch=" << scratch << ")";
   return os.str();
 }
 

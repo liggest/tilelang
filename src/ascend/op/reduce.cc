@@ -44,21 +44,22 @@ struct Reduce : backend::ReduceLowerer<Reduce> {
 
   static std::string MakeBatchAllReduce(std::string reducer,
                                         int reducing_threads, int scale,
-                                        PrimExpr thread_offset, PrimExpr, int,
-                                        int, Target) {
+                                        PrimExpr thread_offset,
+                                        PrimExpr all_threads, int, int,
+                                        Target) {
     std::stringstream ss;
     ss << "tl::AscendAllReduce<" << reducer << ", " << reducing_threads << ", "
-       << scale << ", " << thread_offset << ">::run";
+       << scale << ", " << thread_offset << ", " << all_threads << ">::run";
     return ss.str();
   }
 
   static std::string MakeScalarAllReduce(std::string reducer,
                                          int reducing_threads, int scale,
-                                         PrimExpr thread_offset, PrimExpr,
-                                         Target) {
+                                         PrimExpr thread_offset,
+                                         PrimExpr all_threads, Target) {
     std::stringstream ss;
     ss << "tl::AscendAllReduce<" << reducer << ", " << reducing_threads << ", "
-       << scale << ", " << thread_offset << ">::run";
+       << scale << ", " << thread_offset << ", " << all_threads << ">::run";
     return ss.str();
   }
 };
